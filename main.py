@@ -31,7 +31,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("repo_url", help="GitHub repository URL, e.g. https://github.com/owner/repo")
     parser.add_argument("--branch", default="main", help="Branch to review (default: main)")
-    parser.add_argument("--max-files", type=int, default=100, help="Max Python files to review")
+    parser.add_argument(
+        "--max-files", type=int, default=10,
+        help=(
+            "Max Python files to review (default: 10). Kept low by default "
+            "because Gemini's free tier caps requests per day; raise this "
+            "with --max-files if you have a higher quota or paid billing."
+        ),
+    )
     parser.add_argument("--out", default="review_report.md", help="Output Markdown report path")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable INFO-level logging")
     return parser.parse_args(argv)

@@ -84,6 +84,7 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_MAX_FILES_PER_BATCH = 10
 DEFAULT_MAX_CHARS_PER_BATCH = 60_000
 MAX_RETRIES = 3
+INTER_BATCH_DELAY_S = 5
 
 SEVERITY_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 SEVERITY_RANK = {level: rank for rank, level in enumerate(SEVERITY_LEVELS)}
@@ -174,7 +175,15 @@ class GeminiReviewer:
         all_issues: list[ReviewIssue] = []
         summaries: list[str] = []
 
-        for batch in batches:
+        for i, batch in enumerate(batches):
+            if i > 0:
+                # Free-tier Gemini quotas are tight enough that firing batches
+                # back-to-back can trip the per-minute rate limit even though
+                # each individual request would otherwise succeed. A short
+                # pause between batches avoids paying for that with a full
+                # exponential-backoff cycle on every multi-batch review.
+                time.sleep(INTER_BATCH_DELAY_S)
+
             batch_paths = {f.path for f in batch}
             batch_findings = [
                 fnd for fnd in getattr(scan_report, "findings", [])
