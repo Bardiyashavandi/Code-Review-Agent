@@ -1,0 +1,381 @@
+"""
+github_fetcher.py
+-----------------
+Fetches Python source files from a GitHub repository using the GitHub REST API v3.
+
+Usage:
+    import os
+    from github_fetcher import GitHubFetcher
+
+    fetcher = GitHubFetcher(token=os.environ["GITHUB_TOKEN"])
+    files = fetcher.fetch_python_files("https://github.com/owner/repo")
+    for f in files:
+        print(f.path, len(f.content))
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+from urllib.parse import urlparse
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+class GitHubFetcherError(Exception):
+    """Base error for all github_fetcher failures."""
+    def __init__(self, message: str, http_status: Optional[int] = None):
+        super().__init__(message)
+        self.message = message
+        self.http_status = http_status
+
+
+class RepoNotFoundError(GitHubFetcherError):
+    """Raised when the repository does not exist or is inaccessible."""
+
+
+class AuthenticationError(GitHubFetcherError):
+    """Raised when the GitHub token is invalid or expired."""
+
+
+class RateLimitError(GitHubFetcherError):
+    """Raised when retries are exhausted due to rate limiting."""
+
+
+class GitHubAPIError(GitHubFetcherError):
+    """Raised for unexpected 4xx/5xx responses."""
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FileResult:
+    path: str
+    content: str
+    sha: str
+    size: int
+    url: str
+
+
+@dataclass
+class FetchResult:
+    files: list[FileResult] = field(default_factory=list)
+    truncated: bool = False
+
+
+@dataclass
+class TreeNode:
+    path: str
+    sha: str
+    size: int
+    url: str
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+EXCLUDE_DIRS = {
+    "test", "tests", ".github", "venv", ".venv",
+    "node_modules", "migrations", "__pycache__",
+}
+
+DEFAULT_BASE_URL = "https://api.github.com"
+DEFAULT_BRANCH = "main"
+DEFAULT_MAX_FILES = 100
+DEFAULT_MAX_BYTES = 500_000
+DEFAULT_TIMEOUT = 10
+MAX_RETRIES = 3
+
+
+# ---------------------------------------------------------------------------
+# Fetcher
+# ---------------------------------------------------------------------------
+
+class GitHubFetcher:
+    """
+    Fetches Python files from a GitHub repository.
+
+    Parameters
+    ----------
+    token : str
+        GitHub Personal Access Token. Read from the caller's environment —
+        never hardcode this value.
+    base_url : str
+        GitHub API base URL. Override in tests to point at a mock server.
+    timeout : int
+        HTTP request timeout in seconds.
+    """
+
+    def __init__(
+        self,
+        token: str,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout: int = DEFAULT_TIMEOUT,
+    ) -> None:
+        if not token or not token.strip():
+            raise ValueError("GITHUB_TOKEN must not be empty")
+        self._token = token
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+        self._client = httpx.Client(
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=self._timeout,
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def parse_repo_url(self, url: str) -> tuple[str, str]:
+        """
+        Parse a GitHub repo URL into (owner, repo).
+
+        Accepts:
+            https://github.com/owner/repo
+            https://github.com/owner/repo.git   (strips .git)
+
+        Rejects:
+            Any non-github.com host
+            URLs with subpaths beyond /owner/repo
+            URLs with query strings or fragments
+        """
+        parsed = urlparse(url.strip())
+
+        if parsed.scheme not in ("https", "http"):
+            raise ValueError(f"Invalid URL scheme: {parsed.scheme!r}. Must be https://github.com/owner/repo")
+
+        if parsed.netloc not in ("github.com", "www.github.com"):
+            raise ValueError(f"Invalid host: {parsed.netloc!r}. Only github.com is supported.")
+
+        if parsed.query or parsed.fragment:
+            raise ValueError("URL must not contain query strings or fragments.")
+
+        parts = [p for p in parsed.path.strip("/").split("/") if p]
+        if len(parts) != 2:
+            raise ValueError(
+                f"URL must be exactly https://github.com/owner/repo — got path {parsed.path!r}"
+            )
+
+        owner, repo = parts
+        repo = repo.removesuffix(".git")
+
+        if not owner or not repo:
+            raise ValueError("owner and repo must be non-empty strings.")
+
+        return owner, repo
+
+    def fetch_python_files(
+        self,
+        url: str,
+        branch: str = DEFAULT_BRANCH,
+        max_files: int = DEFAULT_MAX_FILES,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+    ) -> FetchResult:
+        """
+        Main entry point. Returns a FetchResult containing matched FileResult objects.
+
+        Parameters
+        ----------
+        url       : GitHub repository URL.
+        branch    : Branch or tag ref. Defaults to "main".
+        max_files : Maximum number of .py files to return.
+        max_bytes : Per-file byte size cap; larger files are skipped.
+        """
+        owner, repo = self.parse_repo_url(url)
+        tree_nodes = self._fetch_tree(owner, repo, branch)
+
+        python_nodes = self._filter_nodes(tree_nodes, max_bytes)
+
+        truncated = len(python_nodes) > max_files
+        python_nodes = python_nodes[:max_files]
+
+        if truncated:
+            logger.warning(
+                "Repository has more than %d matching Python files; "
+                "only the first %d will be reviewed.",
+                max_files, max_files,
+            )
+
+        files: list[FileResult] = []
+        for node in python_nodes:
+            result = self._fetch_file(owner, repo, node)
+            if result is not None:
+                files.append(result)
+
+        return FetchResult(files=files, truncated=truncated)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_tree(self, owner: str, repo: str, branch: str) -> list[TreeNode]:
+        """Fetch the full recursive file tree for the given branch."""
+        url = f"{self._base_url}/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
+        data = self._get(url)
+
+        nodes = []
+        for item in data.get("tree", []):
+            if item.get("type") != "blob":
+                continue
+            nodes.append(TreeNode(
+                path=item["path"],
+                sha=item["sha"],
+                size=item.get("size", 0),
+                url=item.get("url", ""),
+            ))
+        return nodes
+
+    def _filter_nodes(self, nodes: list[TreeNode], max_bytes: int) -> list[TreeNode]:
+        """Keep only .py files outside excluded directories and within size limit."""
+        filtered = []
+        for node in nodes:
+            if not node.path.endswith(".py"):
+                continue
+
+            top_dir = node.path.split("/")[0].lower()
+            if top_dir in EXCLUDE_DIRS:
+                logger.debug("Skipping excluded directory: %s", node.path)
+                continue
+
+            if node.size > max_bytes:
+                logger.warning(
+                    "Skipping %s — size %d bytes exceeds limit of %d bytes.",
+                    node.path, node.size, max_bytes,
+                )
+                continue
+
+            filtered.append(node)
+        return filtered
+
+    def _fetch_file(self, owner: str, repo: str, node: TreeNode) -> Optional[FileResult]:
+        """Fetch and decode a single file's content."""
+        url = f"{self._base_url}/repos/{owner}/{repo}/contents/{node.path}"
+        try:
+            data = self._get(url)
+        except GitHubFetcherError as exc:
+            logger.warning("Could not fetch %s: %s", node.path, exc.message)
+            return None
+
+        raw_content = data.get("content", "")
+        try:
+            decoded = base64.b64decode(raw_content).decode("utf-8")
+        except Exception:
+            logger.warning("Could not decode content of %s — skipping.", node.path)
+            return None
+
+        return FileResult(
+            path=node.path,
+            content=decoded,
+            sha=data.get("sha", node.sha),
+            size=node.size,
+            url=url,
+        )
+
+    def _get(self, url: str) -> dict:
+        """
+        Perform a GET request with retry logic for rate limiting.
+        Raises appropriate GitHubFetcherError subclasses on failure.
+        Token is never included in exception messages.
+        """
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                response = self._client.get(url)
+            except httpx.TimeoutException:
+                raise GitHubAPIError(f"Request timed out: {url}")
+            except httpx.RequestError as exc:
+                raise GitHubAPIError(f"Network error: {exc}")
+
+            self._handle_rate_limit_headers(response)
+
+            if response.status_code == 200:
+                return response.json()
+
+            if response.status_code == 404:
+                raise RepoNotFoundError(
+                    f"Repository not found or inaccessible: {url}",
+                    http_status=404,
+                )
+
+            if response.status_code == 401:
+                raise AuthenticationError(
+                    "Invalid or expired GitHub token. Check your GITHUB_TOKEN.",
+                    http_status=401,
+                )
+
+            retry_after = self._get_retry_after(response)
+            if response.status_code in (403, 429) and retry_after is not None:
+                if attempt < MAX_RETRIES:
+                    sleep_time = retry_after * (2 ** attempt)
+                    logger.warning(
+                        "Rate limited (HTTP %d). Sleeping %ss before retry %d/%d.",
+                        response.status_code, sleep_time, attempt + 1, MAX_RETRIES,
+                    )
+                    time.sleep(sleep_time)
+                    continue
+                else:
+                    raise RateLimitError(
+                        f"Rate limit retries exhausted after {MAX_RETRIES} attempts.",
+                        http_status=response.status_code,
+                    )
+
+            raise GitHubAPIError(
+                f"Unexpected GitHub API response {response.status_code} for {url}",
+                http_status=response.status_code,
+            )
+
+        raise GitHubAPIError("Exceeded maximum retries.")  # should be unreachable
+
+    def _handle_rate_limit_headers(self, response: httpx.Response) -> None:
+        """Sleep proactively if rate limit is nearly exhausted."""
+        remaining = response.headers.get("X-RateLimit-Remaining")
+        reset = response.headers.get("X-RateLimit-Reset")
+        if remaining is not None and reset is not None:
+            try:
+                if int(remaining) <= 5:
+                    sleep_until = int(reset) + 1
+                    sleep_for = max(0, sleep_until - time.time())
+                    if sleep_for > 0:
+                        logger.warning(
+                            "Rate limit nearly exhausted (%s remaining). "
+                            "Sleeping %.1fs until reset.",
+                            remaining, sleep_for,
+                        )
+                        time.sleep(sleep_for)
+            except ValueError:
+                pass
+
+    @staticmethod
+    def _get_retry_after(response: httpx.Response) -> Optional[int]:
+        """Extract Retry-After header value in seconds, if present."""
+        value = response.headers.get("Retry-After")
+        if value:
+            try:
+                return int(value)
+            except ValueError:
+                return 1
+        return 1 if response.status_code in (403, 429) else None
+
+    def close(self) -> None:
+        """Close the underlying HTTP client."""
+        self._client.close()
+
+    def __enter__(self) -> "GitHubFetcher":
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.close()

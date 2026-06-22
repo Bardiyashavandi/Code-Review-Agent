@@ -1,0 +1,16 @@
+httpx==0.28.1
+google-genai==2.9.0
+google-adk==2.3.0
+pytest==9.1.1
+python-dotenv==1.2.2
+
+# semgrep is intentionally NOT listed here. google-adk pins
+# opentelemetry-api/sdk to 1.39-1.42.1 while semgrep pins it to ~1.37.0 --
+# those ranges are mutually exclusive in one environment. Install semgrep
+# as an isolated CLI tool instead, so its dependency tree never touches
+# this project's virtualenv:
+#
+#   pipx install semgrep
+#
+# semgrep_runner.py only requires the `semgrep` binary on PATH; it never
+# imports the semgrep Python package directly.
