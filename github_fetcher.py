@@ -178,6 +178,27 @@ class GitHubFetcher:
 
         return owner, repo
 
+    def get_repo_metadata(self, url: str) -> dict:
+        """
+        Fetch basic repo metadata (language, size, stars, last push, default
+        branch) via GET /repos/{owner}/{repo} — a single lightweight call,
+        useful for an agent to inspect a repo before deciding how deep to go.
+        """
+        owner, repo = self.parse_repo_url(url)
+        data = self._get(f"{self._base_url}/repos/{owner}/{repo}")
+        return {
+            "owner": owner,
+            "repo": repo,
+            "description": data.get("description") or "",
+            "language": data.get("language") or "",
+            "default_branch": data.get("default_branch", DEFAULT_BRANCH),
+            "size_kb": data.get("size", 0),
+            "stargazers_count": data.get("stargazers_count", 0),
+            "open_issues_count": data.get("open_issues_count", 0),
+            "pushed_at": data.get("pushed_at") or "",
+            "archived": bool(data.get("archived", False)),
+        }
+
     def fetch_python_files(
         self,
         url: str,

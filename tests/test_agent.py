@@ -22,10 +22,14 @@ import pytest
 from agent import (
     CodeReviewAgent,
     PipelineResult,
+    make_explain_finding_tool,
     make_fetch_repo_files_tool,
+    make_generate_report_file_tool,
     make_generate_review_tool,
+    make_get_repo_metadata_tool,
     make_review_repo_tool,
     make_scan_code_tool,
+    make_search_code_tool,
 )
 from gemini_reviewer import GeminiRateLimitError
 from semgrep_runner import SemgrepExecutionError
@@ -327,6 +331,169 @@ class TestGranularAdkTools:
 
         with pytest.raises(ValueError, match="files"):
             tool([])
+
+
+# ---------------------------------------------------------------------------
+# 4c. "Interesting" extra tools: metadata, search, explain, save-report
+# ---------------------------------------------------------------------------
+
+class TestRepoMetadata:
+
+    def test_get_repo_metadata_delegates_to_fetcher(self):
+        agent, mock_fetcher, *_ = make_agent()
+        mock_fetcher.get_repo_metadata.return_value = {"owner": "o", "repo": "r"}
+
+        result = agent.get_repo_metadata("https://github.com/o/r")
+
+        mock_fetcher.get_repo_metadata.assert_called_once_with("https://github.com/o/r")
+        assert result == {"owner": "o", "repo": "r"}
+
+    def test_get_repo_metadata_tool_returns_json_serializable_dict(self):
+        agent, mock_fetcher, *_ = make_agent()
+        mock_fetcher.get_repo_metadata.return_value = {
+            "owner": "o", "repo": "r", "language": "Python",
+            "default_branch": "main", "size_kb": 10, "stargazers_count": 5,
+            "open_issues_count": 0, "pushed_at": "", "archived": False, "description": "",
+        }
+        tool = make_get_repo_metadata_tool(agent)
+
+        output = tool("https://github.com/o/r")
+
+        json.dumps(output)
+        assert output["language"] == "Python"
+
+    def test_get_repo_metadata_tool_rejects_empty_url(self):
+        agent, *_ = make_agent()
+        tool = make_get_repo_metadata_tool(agent)
+
+        with pytest.raises(ValueError, match="repo_url"):
+            tool("")
+
+
+class TestSearchCode:
+
+    def test_search_code_finds_matching_lines(self):
+        agent, *_ = make_agent()
+        files = [
+            SimpleNamespace(path="a.py", content="x = eval(user_input)\ny = 2\n"),
+            SimpleNamespace(path="b.py", content="z = 3\n"),
+        ]
+
+        matches = agent.search_code(files, pattern=r"eval\(")
+
+        assert len(matches) == 1
+        assert matches[0]["path"] == "a.py"
+        assert matches[0]["line"] == 1
+
+    def test_search_code_is_case_insensitive_by_default(self):
+        agent, *_ = make_agent()
+        files = [SimpleNamespace(path="a.py", content="TODO: fix this\n")]
+
+        matches = agent.search_code(files, pattern="todo")
+
+        assert len(matches) == 1
+
+    def test_search_code_rejects_empty_pattern(self):
+        agent, *_ = make_agent()
+        with pytest.raises(ValueError, match="pattern"):
+            agent.search_code([], pattern="")
+
+    def test_search_code_rejects_invalid_regex(self):
+        agent, *_ = make_agent()
+        with pytest.raises(ValueError, match="regex"):
+            agent.search_code([SimpleNamespace(path="a.py", content="x\n")], pattern="(")
+
+    def test_search_code_tool_returns_json_serializable_dict(self):
+        agent, *_ = make_agent()
+        tool = make_search_code_tool(agent)
+
+        output = tool([{"path": "a.py", "content": "eval(x)\n"}], "eval")
+
+        json.dumps(output)
+        assert output["match_count"] == 1
+
+    def test_search_code_tool_rejects_empty_files(self):
+        agent, *_ = make_agent()
+        tool = make_search_code_tool(agent)
+
+        with pytest.raises(ValueError, match="files"):
+            tool([], "eval")
+
+
+class TestExplainFinding:
+
+    def test_explain_finding_delegates_to_reviewer(self):
+        agent, _, _, mock_reviewer = make_agent()
+        mock_reviewer.explain_issue.return_value = "This matters because..."
+
+        result = agent.explain_finding(
+            path="a.py", title="SQL injection", description="raw query"
+        )
+
+        mock_reviewer.explain_issue.assert_called_once()
+        assert result == "This matters because..."
+
+    def test_explain_finding_tool_returns_json_serializable_dict(self):
+        agent, _, _, mock_reviewer = make_agent()
+        mock_reviewer.explain_issue.return_value = "Explanation text."
+        tool = make_explain_finding_tool(agent)
+
+        output = tool(path="a.py", title="SQL injection", description="raw query")
+
+        json.dumps(output)
+        assert output["explanation"] == "Explanation text."
+
+    def test_explain_finding_tool_rejects_missing_title_and_description(self):
+        agent, *_ = make_agent()
+        tool = make_explain_finding_tool(agent)
+
+        with pytest.raises(ValueError):
+            tool(path="a.py", title="", description="")
+
+
+class TestSaveReport:
+
+    def test_save_report_writes_a_real_markdown_file(self, tmp_path):
+        agent, *_ = make_agent()
+        output_path = str(tmp_path / "report.md")
+
+        result_path = agent.save_report(
+            repo_url="https://github.com/o/r",
+            files=[SimpleNamespace(path="a.py", content="x = 1\n")],
+            findings=[],
+            issues=[],
+            summary="All good.",
+            model="gemini-3.1-flash-lite",
+            output_path=output_path,
+        )
+
+        assert result_path == output_path
+        text = open(output_path, encoding="utf-8").read()
+        assert "All good." in text
+
+    def test_generate_report_file_tool_returns_json_serializable_dict(self, tmp_path):
+        agent, *_ = make_agent()
+        tool = make_generate_report_file_tool(agent)
+        output_path = str(tmp_path / "report.md")
+
+        output = tool(
+            repo_url="https://github.com/o/r",
+            files=[{"path": "a.py", "content": "x = 1\n"}],
+            issues=[{"path": "a.py", "line": 1, "severity": "LOW", "title": "t", "description": "d", "suggested_fix": "f"}],
+            summary="ok",
+            model="gemini-3.1-flash-lite",
+            output_path=output_path,
+        )
+
+        json.dumps(output)
+        assert output["output_path"] == output_path
+
+    def test_generate_report_file_tool_rejects_empty_files(self):
+        agent, *_ = make_agent()
+        tool = make_generate_report_file_tool(agent)
+
+        with pytest.raises(ValueError, match="files"):
+            tool(repo_url="https://github.com/o/r", files=[], issues=[])
 
 
 # ---------------------------------------------------------------------------

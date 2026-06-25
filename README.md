@@ -4,10 +4,11 @@
 
 **Give it a GitHub URL. Get back a prioritized, fix-it-now code review.**
 
-![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-92%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-107%20passing-brightgreen)
 ![ADK](https://img.shields.io/badge/Google%20ADK-2.0-orange)
+![ADK Tools](https://img.shields.io/badge/ADK%20tools-8-blueviolet)
 ![Cost](https://img.shields.io/badge/cost-%240-success)
 
 Kaggle 5-Day AI Agents Capstone — track: **Agents for Business**
@@ -68,6 +69,31 @@ Only a fetch failure is treated as fatal — there's nothing to review without f
 | 1. Fetch | `github_fetcher.py` | Walks the repo tree via the GitHub API, pulls every Python file, skips venvs/build noise |
 | 2. Scan | `semgrep_runner.py` | Writes files into an isolated sandbox, runs Semgrep, parses JSON into typed findings |
 | 3. Review | `gemini_reviewer.py` | Batches code + findings into prompts, asks Gemini 3.1 Flash Lite for a structured, severity-ranked review |
+
+### The agent's tool graph
+
+`agent.py` doesn't just run that pipeline once — it exposes **eight separate tools** to the ADK agent, so the model plans its own path through them instead of always running the whole thing:
+
+```
+                              ┌─────────────────────┐
+                              │   code_review_agent  │
+                              └──────────┬───────────┘
+              ┌───────────────┬──────────┼──────────┬───────────────┐
+              │               │          │          │               │
+       review_repo_tool  fetch_repo_  scan_code_ generate_  get_repo_metadata_
+       (one-shot:        files_tool   tool       review_tool tool
+        fetch+scan+                                          (lightweight repo
+        review)                                               check, no fetch)
+              │               │          │          │               │
+      ┌───────┴───────┐       │          │          │       ┌───────┴────────┐
+      │               │       │          │          │       │                │
+search_code_in_   explain_finding_                       generate_report_
+files_tool        tool                                   file_tool
+(grep across       (deep-dive on                          (save review to
+fetched files)      one issue)                             a real .md file)
+```
+
+A one-line request like *"review this repo"* collapses to a single tool call. A narrower request — *"just show me the files,"* *"find every place using eval,"* *"explain that issue further,"* *"save this as a file"* — makes the model pick (and chain) the right tool(s) itself, which is the actual point of using an agent framework instead of one big function.
 
 ## What a run actually looks like
 
@@ -144,7 +170,7 @@ adk_agent = build_adk_agent(
 )
 ```
 
-Run `adk_agent` through any ADK `Runner` (e.g. `google.adk.runners.InMemoryRunner`) — or just run `python3 adk_demo.py` for a ready-made example. The agent exposes four tools, not one:
+Run `adk_agent` through any ADK `Runner` (e.g. `google.adk.runners.InMemoryRunner`) — or just run `python3 adk_demo.py` for a ready-made example. The agent exposes eight tools, not one:
 
 | Tool | Does |
 |---|---|
@@ -152,10 +178,14 @@ Run `adk_agent` through any ADK `Runner` (e.g. `google.adk.runners.InMemoryRunne
 | `fetch_repo_files_tool` | Fetch a repo's Python files only |
 | `scan_code_tool` | Run Semgrep on a given set of files only |
 | `generate_review_tool` | Ask Gemini to review a given set of files (+ optional findings) only |
+| `get_repo_metadata_tool` | Look up a repo's language, size, stars, default branch — no file fetch |
+| `search_code_in_files_tool` | Regex/keyword search across already-fetched files |
+| `explain_finding_tool` | Ask Gemini for a focused, deeper explanation of one already-known issue |
+| `generate_report_file_tool` | Render an already-produced review as Markdown and save it to disk |
 
-For a typical request like *"review https://github.com/owner/repo and summarize the top issues,"* the model calls `review_repo_tool` directly. For a narrower request — *"just show me the files in this repo"* or *"just run static analysis on this code"* — the model instead plans a multi-step call sequence using the granular tools, passing each tool's output into the next itself. Both paths were exercised and verified live in the ADK Dev UI playground.
+For a typical request like *"review https://github.com/owner/repo and summarize the top issues,"* the model calls `review_repo_tool` directly. For a narrower request — *"just show me the files in this repo,"* *"just run static analysis,"* *"find every place using eval,"* *"explain issue #3 in more detail,"* or *"save that as a file"* — the model instead reaches for the appropriate single tool, or plans a multi-step call sequence using the granular pipeline tools, passing each tool's output into the next itself. The agent's instructions also keep it in scope: asked something unrelated to code review, it declines and redirects rather than forcing an unrelated tool call. All of this was exercised and verified live in the ADK Dev UI playground, where the tool graph now shows eight distinct nodes branching from the agent.
 
-This was verified two independent ways: once via the standalone `adk_demo.py` script, and again interactively in Google's own ADK Dev UI playground (`adk web`), which loads `agent.py`'s module-level `root_agent` and lets you chat with the agent directly in a browser. Both surfaced the same correct behavior — the model deciding on its own to call `review_repo_tool` and returning an accurate, severity-ranked summary — which is stronger evidence than either check alone, since the Dev UI is Google's own tooling, not code this project wrote.
+This was verified two independent ways: once via the standalone `adk_demo.py` script, and again interactively in Google's own ADK Dev UI playground (`adk web`), which loads `agent.py`'s module-level `root_agent` and lets you chat with the agent directly in a browser, complete with a visual graph of all eight tool nodes. Both surfaced the same correct behavior — the model picking the right tool (or chaining several) for the request and returning accurate, well-formed output — which is stronger evidence than either check alone, since the Dev UI is Google's own tooling, not code this project wrote.
 
 ## Security, by design
 
@@ -172,7 +202,7 @@ This was verified two independent ways: once via the standalone `adk_demo.py` sc
 pytest -v
 ```
 
-92 tests across all five modules. Every external dependency — GitHub's API, the Semgrep subprocess, the Gemini SDK — is mocked, so the suite runs in about a second with no network access or credentials.
+107 tests across all five modules. Every external dependency — GitHub's API, the Semgrep subprocess, the Gemini SDK — is mocked, so the suite runs in about a second with no network access or credentials.
 
 ## Real-world verification, not just mocks
 
@@ -200,7 +230,7 @@ code-review-agent/
 ├── main.py                   # CLI entry point
 ├── adk_demo.py                # standalone ADK tool-calling demo
 ├── *_spec.md                  # spec written before each module's code
-├── tests/                     # 83 tests, one file per module
+├── tests/                     # 107 tests, one file per module
 ├── deploy/                    # optional cloud-deployment scaffold (not used for this
 │                               # submission — see "Known limitations"), generated by
 │                               # `agents-cli`: Dockerfile, FastAPI wrapper, uv-based build

@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -27,7 +28,8 @@ from dataclasses import dataclass, field
 from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
 
-from gemini_reviewer import GeminiReviewer, GeminiReviewerError, ReviewReport
+import report_generator
+from gemini_reviewer import GeminiReviewer, GeminiReviewerError, ReviewIssue, ReviewReport
 from github_fetcher import FetchResult, FileResult, GitHubFetcher
 from semgrep_runner import Finding, ScanReport, SemgrepRunner, SemgrepRunnerError
 
@@ -189,6 +191,80 @@ class CodeReviewAgent:
         """Ask Gemini to review an already-fetched list of files, optionally
         grounded by an already-computed ScanReport — no fetch, no scan."""
         return self._reviewer.review(files, scan_report)
+
+    # --- Additional, "interesting" tools -----------------------------------
+    # Each of these is a distinct capability beyond the core fetch/scan/review
+    # pipeline, intended to give the ADK agent more genuine planning choices.
+
+    def get_repo_metadata(self, url: str) -> dict:
+        """Look up a repo's language, size, stars, and default branch
+        without fetching any file contents."""
+        return self._fetcher.get_repo_metadata(url)
+
+    def search_code(
+        self, files: list[FileResult], pattern: str, case_sensitive: bool = False
+    ) -> list[dict]:
+        """Search already-fetched files for a regex pattern, returning each
+        matching line. Pure local string search — no extra API/LLM calls."""
+        if not pattern:
+            raise ValueError("pattern must not be empty")
+
+        flags = 0 if case_sensitive else re.IGNORECASE
+        try:
+            compiled = re.compile(pattern, flags)
+        except re.error as exc:
+            raise ValueError(f"Invalid regex pattern: {exc}") from exc
+
+        matches: list[dict] = []
+        for f in files:
+            for line_no, line in enumerate(f.content.splitlines(), start=1):
+                if compiled.search(line):
+                    matches.append({"path": f.path, "line": line_no, "snippet": line.strip()})
+        return matches
+
+    def explain_finding(
+        self,
+        path: str,
+        title: str,
+        description: str,
+        severity: str = "MEDIUM",
+        snippet: str = "",
+        rule_id: str | None = None,
+    ) -> str:
+        """Ask Gemini for a deeper, focused explanation of one already-known
+        issue — separate from the bulk generate_review() call."""
+        return self._reviewer.explain_issue(
+            path=path, title=title, description=description,
+            severity=severity, snippet=snippet, rule_id=rule_id,
+        )
+
+    def save_report(
+        self,
+        repo_url: str,
+        files: list[FileResult],
+        findings: list[Finding],
+        issues,
+        summary: str,
+        model: str,
+        output_path: str = "review_report.md",
+    ) -> str:
+        """Render an already-assembled review as Markdown and write it to
+        disk, reusing report_generator.py's renderer. Builds a minimal
+        PipelineResult-shaped object from already-known pieces — no fetch,
+        scan, or review call of its own."""
+        fetch_result = FetchResult(files=files, truncated=False)
+        scan_report = ScanReport(findings=findings, scanned=len(files), skipped=[], duration_s=0.0)
+        review_report = ReviewReport(issues=issues, summary=summary, model=model,
+                                      files_reviewed=len(files), duration_s=0.0)
+        result = PipelineResult(
+            repo_url=repo_url,
+            fetch_result=fetch_result,
+            scan_report=scan_report,
+            review_report=review_report,
+            stage_errors=[],
+            duration_s=0.0,
+        )
+        return report_generator.write_report(result, output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +434,121 @@ def make_generate_review_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
     return generate_review_tool
 
 
+def make_get_repo_metadata_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a standalone repo-metadata ADK tool bound to a CodeReviewAgent instance."""
+
+    def get_repo_metadata_tool(repo_url: str) -> dict:
+        """Look up a GitHub repository's language, size, star count, open
+        issue count, and default branch — a fast, lightweight check, useful
+        before deciding whether/how deeply to review a repo. Does not fetch
+        any file contents."""
+        if not isinstance(repo_url, str) or not repo_url.strip():
+            raise ValueError("repo_url must be a non-empty string")
+        return agent.get_repo_metadata(repo_url)
+
+    return get_repo_metadata_tool
+
+
+def make_search_code_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a standalone code-search ADK tool bound to a CodeReviewAgent instance."""
+
+    def search_code_in_files_tool(
+        files: list[dict], pattern: str, case_sensitive: bool = False
+    ) -> dict:
+        """Search a list of already-fetched files (each {"path", "content"})
+        for a regex pattern, e.g. 'eval(' or 'TODO'. Returns every matching
+        line with its path and line number. Use this when the user asks to
+        find specific code, not for a full review."""
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list of {path, content} objects")
+
+        file_results = [
+            FileResult(path=f["path"], content=f.get("content", ""), sha="", size=len(f.get("content", "")), url="")
+            for f in files
+        ]
+        matches = agent.search_code(file_results, pattern, case_sensitive=case_sensitive)
+        return {"pattern": pattern, "matches": matches, "match_count": len(matches)}
+
+    return search_code_in_files_tool
+
+
+def make_explain_finding_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a standalone deep-dive-explanation ADK tool bound to a CodeReviewAgent instance."""
+
+    def explain_finding_tool(
+        path: str,
+        title: str,
+        description: str,
+        severity: str = "MEDIUM",
+        snippet: str = "",
+        rule_id: str | None = None,
+    ) -> dict:
+        """Ask Gemini for a deeper, focused explanation of one specific,
+        already-known issue (why it matters concretely, exact fix). Use this
+        for follow-up questions like 'explain issue #3 in more detail' —
+        not for generating a full review from scratch."""
+        if not title and not description:
+            raise ValueError("title or description must be provided")
+
+        explanation = agent.explain_finding(
+            path=path, title=title, description=description,
+            severity=severity, snippet=snippet, rule_id=rule_id,
+        )
+        return {"path": path, "title": title, "explanation": explanation}
+
+    return explain_finding_tool
+
+
+def make_generate_report_file_tool(agent: CodeReviewAgent) -> Callable[..., dict]:
+    """Build a standalone report-saving ADK tool bound to a CodeReviewAgent instance."""
+
+    def generate_report_file_tool(
+        repo_url: str,
+        files: list[dict],
+        issues: list[dict],
+        summary: str = "",
+        model: str = "",
+        findings: list[dict] | None = None,
+        output_path: str = "review_report.md",
+    ) -> dict:
+        """Render an already-produced review (files + issues + summary) as a
+        Markdown report and save it to disk at output_path. Use this when the
+        user wants a saved file, not just a chat summary."""
+        if not isinstance(files, list) or not files:
+            raise ValueError("files must be a non-empty list of {path, content} objects")
+        if not isinstance(issues, list):
+            raise ValueError("issues must be a list (can be empty)")
+
+        file_results = [
+            FileResult(path=f["path"], content=f.get("content", ""), sha="", size=len(f.get("content", "")), url="")
+            for f in files
+        ]
+        issue_objs = [
+            ReviewIssue(
+                path=i["path"], line=i.get("line", 0), severity=i.get("severity", "MEDIUM"),
+                title=i.get("title", ""), description=i.get("description", ""),
+                suggested_fix=i.get("suggested_fix", ""), rule_id=i.get("rule_id"),
+            )
+            for i in issues
+        ]
+        finding_objs = [
+            Finding(
+                path=fnd["path"], line_start=fnd.get("line_start", 0), line_end=fnd.get("line_end", 0),
+                rule_id=fnd.get("rule_id", ""), severity=fnd.get("severity", "MEDIUM"),
+                message=fnd.get("message", ""), snippet=fnd.get("snippet", ""),
+            )
+            for fnd in (findings or [])
+        ]
+
+        path = agent.save_report(
+            repo_url=repo_url, files=file_results, findings=finding_objs,
+            issues=issue_objs, summary=summary, model=model, output_path=output_path,
+        )
+        return {"output_path": path}
+
+    return generate_report_file_tool
+
+
 def build_adk_agent(
     github_token: str,
     gemini_api_key: str,
@@ -365,10 +556,13 @@ def build_adk_agent(
 ) -> Agent:
     """Construct the Google ADK Agent definition wrapping the review pipeline.
 
-    Exposes both a one-shot tool (review_repo_tool) and three granular
-    single-stage tools (fetch_repo_files_tool, scan_code_tool,
-    generate_review_tool), so the model can either run the whole pipeline
-    in one call or plan and sequence the individual steps itself.
+    Exposes a one-shot tool (review_repo_tool), three granular pipeline-stage
+    tools (fetch_repo_files_tool, scan_code_tool, generate_review_tool), and
+    four standalone capability tools (get_repo_metadata_tool,
+    search_code_in_files_tool, explain_finding_tool,
+    generate_report_file_tool) — eight tools total — so the model can run the
+    whole pipeline in one call, plan a multi-step sequence itself, or reach
+    for a narrower capability outside the review pipeline entirely.
     """
     code_review_agent = CodeReviewAgent(
         github_token=github_token,
@@ -388,6 +582,18 @@ def build_adk_agent(
     generate_review_tool = make_generate_review_tool(code_review_agent)
     generate_review_tool.__name__ = "generate_review_tool"
 
+    get_repo_metadata_tool = make_get_repo_metadata_tool(code_review_agent)
+    get_repo_metadata_tool.__name__ = "get_repo_metadata_tool"
+
+    search_code_in_files_tool = make_search_code_tool(code_review_agent)
+    search_code_in_files_tool.__name__ = "search_code_in_files_tool"
+
+    explain_finding_tool = make_explain_finding_tool(code_review_agent)
+    explain_finding_tool.__name__ = "explain_finding_tool"
+
+    generate_report_file_tool = make_generate_report_file_tool(code_review_agent)
+    generate_report_file_tool.__name__ = "generate_report_file_tool"
+
     return Agent(
         name="code_review_agent",
         model=DEFAULT_MODEL,
@@ -396,16 +602,34 @@ def build_adk_agent(
             "quality issues using static analysis and an LLM."
         ),
         instruction=(
+            "You are a code review agent. Your scope is reviewing GitHub "
+            "repositories' Python code for security and quality issues — "
+            "nothing else. If the user asks something unrelated to that scope "
+            "(general chit-chat, unrelated trivia, requests to do something "
+            "outside code review), politely say that's outside what you do "
+            "and offer to review a repo instead. Do not call any tool for an "
+            "out-of-scope request.\n\n"
             "When the user asks for a full review of a GitHub repository, call "
             "review_repo_tool with the repository URL (and branch, if given) — "
             "it runs fetch, scan, and review in one step and is the fastest path "
-            "for a typical request. "
+            "for a typical request.\n\n"
+            "If the user asks for just a quick look at a repo before committing to "
+            "a full review (e.g. 'what kind of repo is this', 'how big is it'), "
+            "use get_repo_metadata_tool first.\n\n"
             "If the user explicitly asks for just one part of the process (e.g. "
             "'just show me the files', 'just run static analysis', 'just review "
-            "this code I'm giving you'), instead use the individual "
-            "fetch_repo_files_tool, scan_code_tool, and generate_review_tool, "
-            "passing the files and findings returned by one tool into the next "
-            "as needed. "
+            "this code I'm giving you'), use the individual fetch_repo_files_tool, "
+            "scan_code_tool, and generate_review_tool, passing the files and "
+            "findings returned by one tool into the next as needed.\n\n"
+            "If the user wants to find specific code (a pattern, function, or "
+            "keyword) rather than a full review, use search_code_in_files_tool "
+            "on files you already fetched.\n\n"
+            "If the user asks you to go deeper on one specific issue you already "
+            "reported (e.g. 'explain issue #3'), use explain_finding_tool instead "
+            "of re-running the whole review.\n\n"
+            "If the user wants the review saved as a file rather than just "
+            "summarized in chat, use generate_report_file_tool with the files, "
+            "issues, and summary you already have.\n\n"
             "Always summarize the resulting issues for the user, prioritized by "
             "severity, and mention any stage_errors plainly if present."
         ),
@@ -414,6 +638,10 @@ def build_adk_agent(
             FunctionTool(fetch_repo_files_tool),
             FunctionTool(scan_code_tool),
             FunctionTool(generate_review_tool),
+            FunctionTool(get_repo_metadata_tool),
+            FunctionTool(search_code_in_files_tool),
+            FunctionTool(explain_finding_tool),
+            FunctionTool(generate_report_file_tool),
         ],
     )
 
