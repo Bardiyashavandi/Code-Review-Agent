@@ -20,10 +20,25 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 import re
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+
+# When ADK's `adk web` loads this file, it imports it as the submodule
+# `code_review_agent.agent`, which only puts the *parent* directory
+# (the one containing code_review_agent/) on sys.path -- not this folder
+# itself. That breaks the plain top-level imports below (report_generator,
+# gemini_reviewer, github_fetcher, semgrep_runner), since Python can't find
+# them as top-level modules anymore. Explicitly adding this file's own
+# directory to sys.path makes the imports work the same way whether this
+# module is run directly (python3 main.py), imported by pytest, or loaded
+# by ADK's package-style agent loader.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
 
 from google.adk.agents import Agent
 from google.adk.tools import FunctionTool
@@ -655,6 +670,13 @@ load_dotenv(override=True)
 
 github_token = os.environ.get("GITHUB_TOKEN", "")
 gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+
+# ADK's own Agent/Gemini model call (used for the playground chat itself,
+# separate from GeminiReviewer's own genai.Client) authenticates via
+# GOOGLE_API_KEY, not GEMINI_API_KEY -- without this, "Hi" gets no response
+# and the Traces panel stays empty because the model call fails auth silently.
+if gemini_api_key and not os.environ.get("GOOGLE_API_KEY"):
+    os.environ["GOOGLE_API_KEY"] = gemini_api_key
 
 root_agent = build_adk_agent(
     github_token=github_token,
